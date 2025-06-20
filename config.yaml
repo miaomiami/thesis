@@ -1,0 +1,32 @@
+# General training settings
+seed: 42
+max_epochs: 40
+batch_size: 2
+learning_rate: 3e-5
+num_workers: 4
+log_every_n_steps: 10
+
+# Model config
+pretrained_model: "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
+freeze_feature_extractor: true
+freeze_encoder_layers: 8
+pooling_method: "mean+std"
+
+# Data config
+csv_path: "data/data_fixed.csv"
+sample_rate: 16000
+
+# Checkpoint & logging
+checkpoint_monitor: "val_acc"
+checkpoint_mode: "max"
+checkpoint_save_top_k: 1
+checkpoint_dir: "checkpoints"
+log_dir: "lightning_logs"
+
+# Resume training
+resume_from_checkpoint: false   # true / false
+start_meeting: ""  # 可以写具体会议ID如 "20200706_L_R001S04C01"，为空则从头开始
+
+# CUDA
+accelerator: "gpu"
+devices: 1
