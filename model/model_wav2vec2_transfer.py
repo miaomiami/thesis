@@ -1,134 +1,112 @@
-import os
-import pandas as pd
 import torch
-import torchaudio
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import LabelEncoder
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+import torch.nn as nn
+import pytorch_lightning as pl
+from transformers import Wav2Vec2Model
 
-from model.model_wav2vec2_cls import Wav2Vec2ForSpeakerClassification
 
-# -----------------------------
-# Dataset class
-# -----------------------------
-class SpeakerDataset(Dataset):
-    def __init__(self, df, label_encoder, sample_rate=16000):
-        self.df = df
-        self.label_encoder = label_encoder
-        self.sample_rate = sample_rate
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        path = self.df.iloc[idx]["path"]
-        label_str = self.df.iloc[idx]["label"]
-        label = self.label_encoder.transform([label_str])[0]
-
-        waveform, sr = torchaudio.load(path)
-        if sr != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
-        return waveform.squeeze(0), label
-
-# -----------------------------
-# Collate function for padding
-# -----------------------------
-def collate_fn(batch):
-    waveforms, labels = zip(*batch)
-    lengths = [w.shape[0] for w in waveforms]
-    max_len = max(lengths)
-    padded_waveforms = torch.zeros(len(batch), max_len)
-
-    for i, waveform in enumerate(waveforms):
-        padded_waveforms[i, :waveform.shape[0]] = waveform
-
-    return padded_waveforms, torch.tensor(labels)
-
-# -----------------------------
-# Train one session
-# -----------------------------
-def train_single_session(session_id, df_session, pretrained_model, batch_size=8, learning_rate=3e-5, max_epochs=20):
-    print(f"\n🔹 Training on session: {session_id}, samples: {len(df_session)}")
-
-    label_encoder = LabelEncoder()
-    label_encoder.fit(df_session["label"])
-    num_classes = len(label_encoder.classes_)
-
-    if num_classes < 2:
-        print(f" Skipping session {session_id} — only one speaker.")
-        return
-
-    # Split data
-    train_df = df_session.sample(frac=0.9, random_state=42)
-    val_df = df_session.drop(train_df.index)
-
-    # Dataset & Dataloader
-    train_ds = SpeakerDataset(train_df, label_encoder)
-    val_ds = SpeakerDataset(val_df, label_encoder)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
-    # Model
-    model = Wav2Vec2ForSpeakerClassification(
-        pretrained_model_name=pretrained_model,
-        num_classes=num_classes,
-        learning_rate=learning_rate,
+class Wav2Vec2ForSpeakerClassification(pl.LightningModule):
+    def __init__(
+        self,
+        pretrained_model_name="jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
+        num_classes=10,
+        learning_rate=3e-5,
         freeze_feature_extractor=True,
         freeze_encoder_layers=8,
         pooling_method="mean+std"
-    )
+    ):
+        super().__init__()
+        self.save_hyperparameters()
 
-    # Checkpointing
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_acc",
-        mode="max",
-        save_top_k=1,
-        filename=f"{session_id}-best-speaker-model"
-    )
+        self.wav2vec2 = Wav2Vec2Model.from_pretrained(pretrained_model_name)
 
-    # Early stopping
-    early_stop_callback = EarlyStopping(
-        monitor="val_acc",
-        mode="max",
-        patience=3,
-        verbose=True
-    )
+        if freeze_feature_extractor:
+            self.wav2vec2.feature_extractor._freeze_parameters()
 
-    # Trainer
-    trainer = Trainer(
-        max_epochs=max_epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        callbacks=[checkpoint_callback, early_stop_callback],
-        log_every_n_steps=10
-    )
+        if freeze_encoder_layers > 0:
+            for layer in self.wav2vec2.encoder.layers[:freeze_encoder_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
 
-    trainer.fit(model, train_loader, val_loader)
-    print(f"✅ Finished training session {session_id}")
+        self.pooling_method = pooling_method
+        hidden_size = self.wav2vec2.config.hidden_size
+        input_dim = hidden_size * 2 if pooling_method == "mean+std" else hidden_size
 
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
 
-# -----------------------------
-# Main function
-# -----------------------------
-def main():
-    # Settings
-    csv_path = "data/data_fixed.csv"
-    pretrained_model = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
-    batch_size = 8
-    learning_rate = 3e-5
-    max_epochs = 20
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.train_epoch_losses = []
+        self.val_epoch_losses = []
+        self.val_epoch_accs = []
 
-    df = pd.read_csv(csv_path)
-    df["label"] = df["label"].astype(str)
+    def _pool_hidden_states(self, hidden_states):
+        if self.pooling_method == "mean":
+            return hidden_states.mean(dim=1)
+        elif self.pooling_method == "max":
+            return hidden_states.max(dim=1).values
+        elif self.pooling_method == "mean+std":
+            mean = hidden_states.mean(dim=1)
+            std = hidden_states.std(dim=1)
+            return torch.cat([mean, std], dim=1)
+        else:
+            raise ValueError(f"Unsupported pooling method: {self.pooling_method}")
 
-    # Extract session ID (e.g., 20200706_L_R001S01C01)
-    df["session"] = df["path"].apply(lambda x: os.path.basename(x).split("_")[0])
+    def forward(self, input_values, attention_mask=None, labels=None):
+        outputs = self.wav2vec2(input_values, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        pooled = self._pool_hidden_states(hidden_states)
+        logits = self.classifier(pooled)
 
-    # Train per session
-    for session_id, df_session in df.groupby("session"):
-        train_single_session(session_id, df_session, pretrained_model,
-                             batch_size=batch_size, learning_rate=learning_rate, max_epochs=max_epochs)
+        loss = self.loss_fn(logits, labels) if labels is not None else None
+        preds = torch.argmax(logits, dim=1)
 
-if __name__ == "__main__":
-    main()
+        return {"loss": loss, "logits": logits, "preds": preds}
+
+    def training_step(self, batch, batch_idx):
+        input_values, labels = batch
+        outputs = self(input_values, labels=labels)
+        self.log("train_loss", outputs["loss"], prog_bar=True)
+        return outputs["loss"]
+
+    def on_train_epoch_end(self):
+        # Extract the epoch train_loss mean from callback_metrics
+        loss = self.trainer.callback_metrics.get("train_loss")
+        if loss is not None:
+            self.train_epoch_losses.append(loss.item())
+
+    def validation_step(self, batch, batch_idx):
+        input_values, labels = batch
+        outputs = self(input_values, labels=labels)
+        acc = (outputs["preds"] == labels).float().mean()
+        self.log("val_loss", outputs["loss"], prog_bar=True)
+        self.log("val_acc", acc, prog_bar=True)
+        return {"val_loss": outputs["loss"], "val_acc": acc}
+
+    def on_validation_epoch_end(self):
+        if len(self.train_epoch_losses) == 0:
+            # Sanity check stage or not trained, skip
+            print(f"Skipping logging on sanity check or before first train epoch")
+            return
+
+        val_loss = self.trainer.callback_metrics.get("val_loss").item()
+        val_acc = self.trainer.callback_metrics.get("val_acc").item()
+        self.val_epoch_losses.append(val_loss)
+        self.val_epoch_accs.append(val_acc)
+        train_loss = self.train_epoch_losses[-1]
+        print(f"Epoch {self.current_epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+
+        if self.global_rank == 0:
+            with open("results_log.csv", "a") as f:
+                if self.current_epoch == 0 and len(self.val_epoch_losses) == 1:
+                    f.write("epoch,train_loss,val_loss,val_acc\n")
+                f.write(f"{self.current_epoch},{train_loss:.4f},{val_loss:.4f},{val_acc:.4f}\n")
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.95)
+        return [optimizer], [scheduler]
+
