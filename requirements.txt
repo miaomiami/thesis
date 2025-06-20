@@ -1,0 +1,14 @@
+# Core dependencies
+torch==2.1.0+cu121
+torchaudio==2.1.0+cu121
+pytorch_lightning==2.0.8
+transformers==4.33.2
+pandas==1.5.3
+scikit-learn==1.2.2
+
+# Optional but recommended
+tensorboard==2.13.0
+huggingface_hub==0.17.3
+
+# Required for progress bar and environment hints
+tqdm==4.66.1
