@@ -4,40 +4,40 @@ import glob
 from pathlib import Path
 import subprocess
 
-# === 配置参数 ===
-RTTM_DIR = "./aishell4_data/rttm"      # .rttm 文件路径
-AUDIO_DIR = "./aishell4_data/wav"      # 原始 .flac 音频路径
-OUTPUT_AUDIO_DIR = "./segments"        # 保存切好的片段
-CSV_PATH = "./data.csv"                # 输出 CSV 文件
-MIN_DURATION = 1.5                     # 最短切段时长（单位秒）
-TARGET_SR = 16000                      # 输出采样率
-AUDIO_EXT = ".wav"                     # 输出音频格式（.wav 或 .flac）
+# Configuration parameters
+RTTM_DIR = "./aishell4_data/rttm"      # .rttm file path
+AUDIO_DIR = "./aishell4_data/wav"      # Original .flac audio path
+OUTPUT_AUDIO_DIR = "./segments"        # Save the cut fragments
+CSV_PATH = "./data.csv"                # Output CSV file
+MIN_DURATION = 1.5                     # Minimum cut duration (in seconds)
+TARGET_SR = 16000                      # Output sampling rate
+AUDIO_EXT = ".wav"                     # Output audio format (.wav or .flac)
 
-# === 创建输出文件夹 ===
+# Create Output Folder
 os.makedirs(OUTPUT_AUDIO_DIR, exist_ok=True)
 
-# === 初始化 CSV ===
+# Initialize CSV
 csvfile = open(CSV_PATH, "w", newline="")
 writer = csv.writer(csvfile)
 writer.writerow(["path", "label"])
 
-# === 解析 rttm 并切音频 ===
+# Parse rttm and cut audio
 for rttm_file in glob.glob(os.path.join(RTTM_DIR, "*.rttm")):
     with open(rttm_file, "r") as f:
         for i, line in enumerate(f):
             parts = line.strip().split()
             if len(parts) < 8 or parts[0] != "SPEAKER":
                 continue
-            basename = parts[1]             # 音频文件名（无扩展名）
+            basename = parts[1]             # Audio file name (without extension)
             start = float(parts[3])
             duration = float(parts[4])
             end = start + duration
             speaker = parts[7]
 
-            # ✅ 构造全局唯一的标签
+            # Constructing a globally unique label
             label = f"{meeting_id}_{speaker}"
 
-            # 过滤掉太短的段落
+            # Filter out paragraphs that are too short
             if duration < MIN_DURATION:
                 continue
 
@@ -45,7 +45,7 @@ for rttm_file in glob.glob(os.path.join(RTTM_DIR, "*.rttm")):
             output_name = f"{speaker}_{i:04d}{AUDIO_EXT}"
             output_path = os.path.join(OUTPUT_AUDIO_DIR, output_name)
 
-            # ffmpeg 裁剪命令
+            # ffmpeg cropping command
             command = [
                 "ffmpeg",
                 "-hide_banner",
@@ -64,4 +64,4 @@ for rttm_file in glob.glob(os.path.join(RTTM_DIR, "*.rttm")):
                 print(f"[Warning] Failed to extract: {output_path}")
 
 csvfile.close()
-print("✅ 音频切段完成，CSV文件已保存至：", CSV_PATH)
+print("The audio segmentation is complete and the CSV file has been saved to:", CSV_PATH)
