@@ -1,129 +1,84 @@
-import os
-import pandas as pd
 import torch
-import torchaudio
-import random
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-
+import torch.nn as nn
 import pytorch_lightning as pl
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
+from transformers import Wav2Vec2Model
 
-from model.model_wav2vec2_cls import Wav2Vec2ForSpeakerClassification
-
-
-# -----------------------------
-# Dataset class
-# -----------------------------
-class SpeakerDataset(Dataset):
-    def __init__(self, df, label_encoder, sample_rate=16000):
-        self.df = df
-        self.label_encoder = label_encoder
-        self.sample_rate = sample_rate
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        path = self.df.iloc[idx]["path"]
-        label_str = self.df.iloc[idx]["label"]
-        label = self.label_encoder.transform([label_str])[0]
-
-        waveform, sr = torchaudio.load(path)
-        if sr != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
-        return waveform.squeeze(0), label
-
-
-# -----------------------------
-# Collate function for padding
-# -----------------------------
-def collate_fn(batch):
-    waveforms, labels = zip(*batch)
-    lengths = [w.shape[0] for w in waveforms]
-    max_len = max(lengths)
-    padded_waveforms = torch.zeros(len(batch), max_len)
-
-    for i, waveform in enumerate(waveforms):
-        padded_waveforms[i, :waveform.shape[0]] = waveform
-
-    return padded_waveforms, torch.tensor(labels)
-
-
-# -----------------------------
-# Main training pipeline
-# -----------------------------
-def main():
-    # 🔧 Settings
-    csv_path = "data/data_fixed.csv"
-    batch_size = 8
-    learning_rate = 1e-4
-    num_workers = 4
-    max_epochs = 10
-    pretrained_model = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
-
-    # Load and encode speaker labels
-    # Load data
-    df = pd.read_csv(csv_path)
-    df["label"] = df["label"].astype(str)  # 防止数字被当作 int 处理
-
-    # Split data FIRST
-    train_df, val_df = train_test_split(df, test_size=0.1, stratify=df["label"], random_state=42)
-
-    # Build label encoder based on train + val
-    all_labels = pd.concat([train_df["label"], val_df["label"]], axis=0)
-    label_encoder = LabelEncoder()
-    label_encoder.fit(all_labels)
-
-    num_classes = len(label_encoder.classes_)
-
-    print(f"Total samples: {len(df)}, Unique speakers: {num_classes}")
-
-    # Split data
-    train_df, val_df = train_test_split(df, test_size=0.1, stratify=df["label"], random_state=42)
-
-    # Datasets and Dataloaders
-    train_ds = SpeakerDataset(train_df, label_encoder)
-    val_ds = SpeakerDataset(val_df, label_encoder)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              collate_fn=collate_fn, num_workers=num_workers)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=num_workers)
-
-    # Model
-    model = Wav2Vec2ForSpeakerClassification(
-        pretrained_model_name=pretrained_model,
-        num_classes=num_classes,
-        learning_rate=learning_rate,
+class Wav2Vec2ForSpeakerClassification(pl.LightningModule):
+    def __init__(
+        self,
+        pretrained_model_name="jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
+        num_classes=10,
+        learning_rate=1e-4,
         freeze_feature_extractor=True,
         freeze_encoder_layers=0,
         pooling_method="mean"
-    )
+    ):
+        super().__init__()
+        self.save_hyperparameters()
 
-    # Checkpointing
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_acc",
-        mode="max",
-        save_top_k=1,
-        filename="best-speaker-model"
-    )
+        self.wav2vec2 = Wav2Vec2Model.from_pretrained(pretrained_model_name)
 
-    # Trainer
-    trainer = Trainer(
-        max_epochs=max_epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        callbacks=[checkpoint_callback],
-        log_every_n_steps=10
-    )
+        if freeze_feature_extractor:
+            self.wav2vec2.feature_extractor._freeze_parameters()
 
-    trainer.fit(model, train_loader, val_loader)
+        if freeze_encoder_layers > 0:
+            for layer in self.wav2vec2.encoder.layers[:freeze_encoder_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
 
-    print("Training complete!")
+        self.pooling_method = pooling_method
+        hidden_size = self.wav2vec2.config.hidden_size
+        self.classifier = nn.Linear(hidden_size, num_classes)
+        self.loss_fn = nn.CrossEntropyLoss()
 
+        # Used to record the val loss / acc of each epoch
+        self.val_losses = []
+        self.val_accs = []
 
-if __name__ == "__main__":
-    main()
+    def forward(self, input_values, attention_mask=None, labels=None):
+        outputs = self.wav2vec2(input_values, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        if self.pooling_method == "mean":
+            pooled = hidden_states.mean(dim=1)
+        elif self.pooling_method == "max":
+            pooled = hidden_states.max(dim=1).values
+        else:
+            raise ValueError("Unsupported pooling method")
+
+        logits = self.classifier(pooled)
+        loss = self.loss_fn(logits, labels) if labels is not None else None
+        return {"loss": loss, "logits": logits}
+
+    def training_step(self, batch, batch_idx):
+        input_values, labels = batch
+        outputs = self(input_values, labels=labels)
+        self.log("train_loss", outputs["loss"])
+        return outputs["loss"]
+
+    def validation_step(self, batch, batch_idx):
+        input_values, labels = batch
+        outputs = self(input_values, labels=labels)
+        preds = torch.argmax(outputs["logits"], dim=1)
+        acc = (preds == labels).float().mean()
+        self.log("val_loss", outputs["loss"], prog_bar=True)
+        self.log("val_acc", acc, prog_bar=True)
+
+        # Save val_loss and val_acc for epoch end
+        self.val_losses.append(outputs["loss"].detach().cpu())
+        self.val_accs.append(acc.detach().cpu())
+        return {"val_loss": outputs["loss"], "val_acc": acc}
+
+    def on_validation_epoch_end(self):
+        # 可以在这里写文件或打印，也可以放在外部 callback 写文件
+        mean_loss = torch.stack(self.val_losses).mean().item()
+        mean_acc = torch.stack(self.val_accs).mean().item()
+        print(f"\nEpoch {self.current_epoch} summary -> val_loss: {mean_loss:.4f}, val_acc: {mean_acc:.4f}")
+
+        # reset
+        self.val_losses.clear()
+        self.val_accs.clear()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.95)
+        return [optimizer], [scheduler]
